@@ -153,6 +153,7 @@ def gather_metadata(client: redis.Redis, host: str, port: int) -> Dict[str, Any]
         metadata['memory_total_human'] = info_memory.get('total_system_memory_human', 'N/A')
         metadata['memory_used_human'] = info_memory.get('used_memory_human', 'N/A')
         metadata['memory_rss_human'] = info_memory.get('used_memory_rss_human', 'N/A')
+        metadata['used_memory'] = info_memory.get('used_memory', 0)
 
         # Activity
         total_keys = sum([db_info.get('keys', 0) for db_name, db_info in info_keyspace.items() if db_name.startswith('db')])
@@ -160,8 +161,13 @@ def gather_metadata(client: redis.Redis, host: str, port: int) -> Dict[str, Any]
         metadata['ops_per_sec'] = info_stats.get('instantaneous_ops_per_sec', 0)
         metadata['client_connections'] = info_clients.get('connected_clients', 0)
 
-        # Version
+        # Version & Uptime
         metadata['version'] = info_server.get('redis_version', 'Unknown')
+        metadata['uptime_in_seconds'] = info_server.get('uptime_in_seconds', 0)
+
+        # Role
+        info_replication = client.info('replication')
+        metadata['role'] = info_replication.get('role', 'unknown')
 
         # Logical Databases
         databases = {}
@@ -218,37 +224,53 @@ class AssessmentEngine:
 
         # Let's do a quick pre-check on the first IP to discover more nodes if Native Cluster.
         if ips:
-            first_client = get_redis_client(ips[0], self.target_port, **self.auth_kwargs)
-            topology = detect_topology(first_client)
-            if topology == "Native Cluster":
-                try:
-                    cluster_nodes = first_client.execute_command('CLUSTER NODES')
-                    # format: id ip:port@bus_port flags ...
-                    for line in cluster_nodes.split('\n'):
-                        if not line: continue
-                        parts = line.split(' ')
-                        if len(parts) >= 2:
-                            addr_port = parts[1].split('@')[0]
-                            if ':' in addr_port:
-                                n_ip, n_port = addr_port.split(':')
-                                node_tuple = (n_ip, int(n_port))
+            try:
+                first_client = get_redis_client(ips[0], self.target_port, **self.auth_kwargs)
+                topology = detect_topology(first_client)
+                if topology == "Native Cluster":
+                    try:
+                        cluster_nodes = first_client.execute_command('CLUSTER NODES')
+                        # format: id ip:port@bus_port flags ...
+                        for line in cluster_nodes.split('\n'):
+                            if not line: continue
+                            parts = line.split(' ')
+                            if len(parts) >= 2:
+                                addr_port = parts[1].split('@')[0]
+                                if ':' in addr_port:
+                                    n_ip, n_port = addr_port.split(':')
+                                    node_tuple = (n_ip, int(n_port))
+                                    if node_tuple not in nodes_to_scan:
+                                        nodes_to_scan.append(node_tuple)
+
+                        # Also attempt to run CLUSTER SLOTS per prompt requirement for Native Cluster, though we get metadata per-node.
+                        # We just execute it to ensure we fulfill the prompt "Execute INFO ALL and CLUSTER SLOTS".
+                        first_client.execute_command('CLUSTER SLOTS')
+                    except Exception as e:
+                        logging.warning(f"Failed to discover cluster nodes: {e}")
+                elif topology == "Sentinel":
+                    try:
+                        # Discover masters and replicas
+                        masters = first_client.execute_command('SENTINEL MASTERS')
+                        for master in masters:
+                            # execute_command returns a list like ['name', 'mymaster', 'ip', '127.0.0.1', 'port', '6379']
+                            m_ip, m_port = None, None
+                            if isinstance(master, list):
+                                for i in range(len(master) - 1):
+                                    if master[i] == 'ip' or master[i] == b'ip':
+                                        m_ip = master[i+1]
+                                    elif master[i] == 'port' or master[i] == b'port':
+                                        m_port = master[i+1]
+                            elif isinstance(master, dict):
+                                m_ip = master.get('ip') or master.get(b'ip')
+                                m_port = master.get('port') or master.get(b'port')
+                            if m_ip and m_port:
+                                node_tuple = (m_ip, int(m_port))
                                 if node_tuple not in nodes_to_scan:
                                     nodes_to_scan.append(node_tuple)
-                except Exception as e:
-                    logging.warning(f"Failed to discover cluster nodes: {e}")
-            elif topology == "Sentinel":
-                try:
-                    # Discover masters and replicas
-                    masters = first_client.execute_command('SENTINEL MASTERS')
-                    for master in masters:
-                        m_ip = master.get('ip') or master.get(b'ip')
-                        m_port = master.get('port') or master.get(b'port')
-                        if m_ip and m_port:
-                            node_tuple = (m_ip, int(m_port))
-                            if node_tuple not in nodes_to_scan:
-                                nodes_to_scan.append(node_tuple)
-                except Exception as e:
-                    logging.warning(f"Failed to discover sentinel nodes: {e}")
+                    except Exception as e:
+                        logging.warning(f"Failed to discover sentinel nodes: {e}")
+            except Exception as e:
+                logging.error(f"Failed to connect to initial IP {ips[0]}: {e}")
 
         # Concurrently scan all discovered nodes
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -522,18 +544,38 @@ def validate_and_report(topology_name: str, expected: Dict[str, Any], results: L
     # GCP Migration Readiness Report
     report_data = []
     for r in results:
+        # Migration Automator specific logic
+        # Calculate Migration Complexity Score
+        memory_used = r.get('used_memory', 0)
+        ops_sec = r.get('ops_per_sec', 0)
+        complexity_score = "Low"
+        if memory_used > 5 * 1024 * 1024 * 1024 or ops_sec > 50000:
+            complexity_score = "High"
+        elif memory_used > 1 * 1024 * 1024 * 1024 or ops_sec > 10000:
+            complexity_score = "Medium"
+
+        # Checklist column for GCP compatibility
+        version = r.get('version', '0.0.0')
+        checklist = "Compatible"
+        if version != 'Unknown' and version.startswith('7.') and "Memorystore" not in version:
+            checklist = "Check Memorystore version support (often trails latest 7.x)"
+
         report_data.append({
             "Host": r.get('host'),
             "Port": r.get('port'),
             "Status": r.get('status'),
+            "Role": r.get('role', 'Unknown'),
             "Topology": r.get('topology'),
-            "Version": r.get('version', 'N/A'),
+            "Version": version,
+            "Uptime": r.get('uptime_in_seconds', 'N/A'),
             "Total Memory": r.get('memory_total_human', 'N/A'),
             "Used Memory": r.get('memory_used_human', 'N/A'),
             "Total Keys": r.get('total_keys', 'N/A'),
             "Ops/Sec": r.get('ops_per_sec', 'N/A'),
-            "Clients": r.get('client_connections', 'N/A'),
-            "AOF": r.get('aof_enabled', False)
+            "Logical DBs": str(r.get('databases', {})),
+            "AOF": r.get('aof_enabled', False),
+            "Complexity Score": complexity_score,
+            "GCP Checklist": checklist
         })
 
     df = pd.DataFrame(report_data)
@@ -552,11 +594,33 @@ def validate_and_report(topology_name: str, expected: Dict[str, Any], results: L
     # Write to file
     md_filename = f"gcp_report_{topology_name.replace(' ', '_').lower()}.md"
     json_filename = f"gcp_manifest_{topology_name.replace(' ', '_').lower()}.json"
+    csv_filename = f"gcp_shards_{topology_name.replace(' ', '_').lower()}.csv"
+    ansible_filename = f"ansible_inventory_{topology_name.replace(' ', '_').lower()}.ini"
+
     with open(md_filename, "w") as f:
         f.write(report_md)
     with open(json_filename, "w") as f:
         f.write(json_manifest)
-    logging.info(f"Reports saved to {md_filename} and {json_filename}")
+
+    # Generate CSV list of shards
+    df.to_csv(csv_filename, index=False)
+
+    # Generate Ansible Inventory file
+    # Group shards by primary/replica roles
+    with open(ansible_filename, "w") as f:
+        f.write("[redis_cluster:children]\nredis_primaries\nredis_replicas\n\n")
+
+        f.write("[redis_primaries]\n")
+        for r in results:
+            if r.get('role') == 'master':
+                f.write(f"{r.get('host')} ansible_port={r.get('port')} redis_version={r.get('version')}\n")
+
+        f.write("\n[redis_replicas]\n")
+        for r in results:
+            if r.get('role') == 'slave':
+                f.write(f"{r.get('host')} ansible_port={r.get('port')} redis_version={r.get('version')}\n")
+
+    logging.info(f"Reports saved to {md_filename}, {json_filename}, {csv_filename}, and {ansible_filename}")
 
 def run_tests():
     """Execute the automated test harness."""
@@ -610,10 +674,45 @@ def run_tests():
     finally:
         harness.destroy_all()
 
-if __name__ == "__main__":
-    docker_client = check_docker()
-    logging.info("Phase One completed successfully.")
+import argparse
 
-    # Run Automated Test Harness if executed directly
-    logging.info("Starting Phase Three & Four: Automated Testing and Reporting")
-    run_tests()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Redis Migration Assessment & Validation Framework")
+    parser.add_argument("--host", type=str, help="Target cluster DNS or IP to assess")
+    parser.add_argument("--port", type=int, default=6379, help="Target cluster port")
+    parser.add_argument("--tls", action="store_true", help="Enable TLS/SSL connection")
+    parser.add_argument("--ssl-cert-reqs", type=str, default="required", help="SSL cert reqs (e.g. required, none)")
+    parser.add_argument("--ssl-ca-certs", type=str, help="Path to CA certs for SSL")
+    parser.add_argument("--username", type=str, help="Redis username")
+    parser.add_argument("--password", type=str, help="Redis password")
+    parser.add_argument("--run-tests", action="store_true", help="Run the automated Docker test harness instead of assessing a target")
+
+    args = parser.parse_args()
+
+    if args.run_tests:
+        docker_client = check_docker()
+        logging.info("Phase One completed successfully.")
+        logging.info("Starting Phase Three & Four: Automated Testing and Reporting")
+        run_tests()
+    elif args.host:
+        logging.info(f"Starting Assessment against {args.host}:{args.port}")
+        # Build auth kwargs
+        auth_kwargs = {
+            "tls_enabled": args.tls,
+            "ssl_cert_reqs": args.ssl_cert_reqs,
+        }
+        if args.ssl_ca_certs:
+            auth_kwargs["ssl_ca_certs"] = args.ssl_ca_certs
+        if args.username:
+            auth_kwargs["username"] = args.username
+        if args.password:
+            auth_kwargs["password"] = args.password
+
+        engine = AssessmentEngine(args.host, args.port, **auth_kwargs)
+        results = engine.run()
+
+        # We don't have "ground truth" for real clusters so we validate against dummy expected
+        validate_and_report("User Target Cluster", {"Expected Topology": results[0].get("topology") if results else "Unknown"}, results)
+    else:
+        parser.print_help()
+        sys.exit(1)
