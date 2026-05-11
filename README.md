@@ -16,40 +16,47 @@ It acts as a zero-dependency tool—meaning it handles the installation of its o
 
 ## Prerequisites
 
-- Python 3.8+
-- (Optional but recommended) Direct network access to the target Redis instances.
-- (Optional) A running Docker daemon is required *only* if you intend to run the automated test harness.
+Before executing the code, ensure the following prerequisites are met:
 
-## Usage
+1. **Python Installation**: You must have Python 3.8 or newer installed on your machine.
+   ```bash
+   python3 --version
+   ```
+2. **Network Access**: The machine running this script must have direct network access to the target Redis cluster IPs or DNS names. Ensure no firewalls are blocking the Redis ports (default 6379, or 9443 for Enterprise).
+3. **Docker (Optional)**: If you intend to run the script's automated test harness to simulate different Redis topologies locally, you must have a running Docker daemon.
 
-You can run the script via the command line. Upon execution, the script will self-install any missing dependencies.
+*Note: The script is designed to be "zero-dependency". When you execute it for the first time, it will automatically use `pip` to install the required Python libraries (`redis`, `docker`, `dnspython`, `pandas`, `tabulate`, `requests`).*
 
-### Assessing a Real Redis Cluster
+## How to Execute the Code
 
-To assess a cluster, you must provide the `--host` parameter. You can optionally provide `--port`, TLS configurations, and credentials.
+You can run the script directly from your terminal or command prompt.
+
+### 1. Assessing a Real Redis Cluster
+
+To assess a cluster, execute the script and pass the `--host` parameter. You can optionally provide `--port`, TLS configurations, and authentication credentials.
 
 ```bash
-# Basic assessment using DNS
-python3 redis_migration_expert.py --host my-redis-cluster.internal.example.com --port 6379
+# Basic execution using a DNS name
+python3 redis_migration_expert.py --host my-redis-cluster.internal.example.com
 
-# Assessment requiring a password and custom port
+# Execution requiring a custom port and password
 python3 redis_migration_expert.py --host 10.0.0.5 --port 12000 --password "mysecretpass"
 
-# Assessment requiring TLS/SSL with specific Certificates
+# Execution requiring TLS/SSL with specific CA Certificates
 python3 redis_migration_expert.py --host secure-cluster.example.com --port 6379 --tls --ssl-ca-certs /path/to/ca.pem
 ```
 
 #### Output Artifacts
 
-After running the assessment, the script will automatically generate the following reports in your current directory:
-- `gcp_report_user_target_cluster.md`: A Markdown-formatted, human-readable summary table.
-- `gcp_manifest_user_target_cluster.json`: The raw JSON dump of all shards and configurations.
-- `gcp_shards_user_target_cluster.csv`: A CSV representation of the nodes.
-- `ansible_inventory_user_target_cluster.ini`: An auto-generated Ansible inventory grouping nodes into primaries and replicas to be used with standard automation playbooks.
+Upon successful execution of the assessment, the script will generate four files in your current working directory:
+- `gcp_report_user_target_cluster.md`: A human-readable Markdown summary table.
+- `gcp_manifest_user_target_cluster.json`: A raw JSON manifest containing deep metrics.
+- `gcp_shards_user_target_cluster.csv`: A CSV file containing a shard-by-shard breakdown.
+- `ansible_inventory_user_target_cluster.ini`: An Ansible inventory file grouping nodes by role (primary/replica) for automated migrations.
 
-### Running the Test Harness
+### 2. Executing the Automated Test Harness
 
-If you want to validate the assessment engine's logic against local mocked environments, use the `--run-tests` flag. Ensure Docker is running.
+If you want to validate the tool's logic without hitting a real cluster, you can execute its built-in test harness. **(Requires Docker)**.
 
 ```bash
 python3 redis_migration_expert.py --run-tests
